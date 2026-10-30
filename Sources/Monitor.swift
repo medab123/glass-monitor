@@ -79,6 +79,8 @@ final class Monitor: ObservableObject {
     @Published private(set) var pressure = MemoryPressure.normal
     @Published private(set) var thermal = ProcessInfo.ThermalState.nominal
     @Published private(set) var power: PowerInfo?
+    @Published private(set) var battery: BatteryHealth?
+    @Published private(set) var sensors = SensorReading()
     @Published private(set) var diskUsed: Int64 = 0
     @Published private(set) var diskTotal: Int64 = 1
     @Published private(set) var readRate = 0.0
@@ -133,6 +135,11 @@ final class Monitor: ObservableObject {
     private var minute = (cpu: 0.0, memory: 0.0, samples: 0)
     private var lastLaravelScan = Date.distantPast
     private var lastPressureAlert = Date.distantPast
+    /// SMC access is created off the main thread (key discovery takes ≈0.4 s); nil until ready.
+    private var smc: SMCSensors?
+    private let sensorQueue = DispatchQueue(label: "glassmonitor.sensors", qos: .utility)
+    /// Threshold alerts that may fire again (re-armed once the value drops back).
+    private var armedThresholds: Set<String> = ["ram", "swap", "disk", "temp"]
     private var lastTicks: CPUTicks?
     private var lastIO: (read: UInt64, write: UInt64)?
     private var lastNet: (received: UInt64, sent: UInt64)?
@@ -150,6 +157,13 @@ final class Monitor: ObservableObject {
     }
 
     func start() {
+        sensorQueue.async {
+            let smc = SMCSensors()
+            DispatchQueue.main.async {
+                self.smc = smc
+                self.readSensors()
+            }
+        }
         tick()
         timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in self?.tick() }
     }
@@ -179,7 +193,13 @@ final class Monitor: ObservableObject {
         gpu = SystemStats.gpuUtilization()
         // Free space is costly to compute (purgeable space accounting) and changes slowly.
         if tickCount % 20 == 0 { (diskUsed, diskTotal) = SystemStats.disk() }
-        if tickCount % 4 == 0 { power = SystemStats.power() }
+        if tickCount % 4 == 0 {
+            power = SystemStats.power()
+            readSensors()
+            checkThresholds()
+        }
+        // Battery wear changes over weeks; refresh every 30 minutes.
+        if tickCount % 1_200 == 0 && power != nil { refreshBatteryHealth() }
 
         let io = SystemStats.diskIOBytes()
         // Counters drop when a disk or disk image is detached; skip that sample instead of wrapping around.
@@ -331,7 +351,59 @@ final class Monitor: ObservableObject {
         }
     }
 
+    // MARK: Sensors
+
+    private func readSensors() {
+        guard let smc, busy.insert("sensors").inserted else { return }
+        sensorQueue.async {
+            let reading = smc.read()
+            DispatchQueue.main.async {
+                self.busy.remove("sensors")
+                if self.sensors != reading { self.sensors = reading }
+            }
+        }
+    }
+
+    private func refreshBatteryHealth() {
+        DispatchQueue.global(qos: .background).async {
+            let health = SystemStats.batteryHealth()
+            DispatchQueue.main.async { self.battery = health }
+        }
+    }
+
     // MARK: Alerts
+
+    /// User-set limits from the "Alert When" menu. Each fires once, then re-arms after the value drops back.
+    private func checkThresholds() {
+        guard prefs.alertsEnabled else { return }
+        let gib = 1_073_741_824.0
+        threshold("ram", value: memFraction, limit: prefs.ramAlert, rearmBelow: prefs.ramAlert - 0.05, tab: .memory) {
+            ("Memory is \(percent(self.memFraction)) full", "\(bytes(Double(self.memUsed))) of \(bytes(Double(self.memTotal))) used")
+        }
+        threshold("swap", value: Double(swapUsed) / gib, limit: prefs.swapAlertGB, rearmBelow: prefs.swapAlertGB - 1, tab: .memory) {
+            ("Swap reached \(bytes(Double(self.swapUsed)))", "The Mac is short of memory and writing it to disk — close some apps")
+        }
+        threshold("disk", value: diskFraction, limit: prefs.diskAlert, rearmBelow: prefs.diskAlert - 0.02, tab: .clean) {
+            ("Disk is \(percent(self.diskFraction)) full",
+             "\(bytes(Double(self.diskTotal - self.diskUsed))) free — the Clean tab can free space")
+        }
+        if let cpu = sensors.cpu {
+            threshold("temp", value: cpu, limit: prefs.tempAlert, rearmBelow: prefs.tempAlert - 10, tab: .cpu) {
+                ("CPU is at \(Int(cpu))°C", "macOS slows the Mac down when it runs this hot — check the CPU tab")
+            }
+        }
+    }
+
+    private func threshold(_ key: String, value: Double, limit: Double, rearmBelow: Double, tab: ListTab,
+                           message: () -> (title: String, detail: String)) {
+        guard limit > 0 else { return }
+        if value >= limit, armedThresholds.remove(key) != nil {
+            let text = message()
+            raise(MonitorAlert(title: text.title, detail: text.detail, pid: nil, processName: nil, tab: tab))
+        } else if value < rearmBelow {
+            armedThresholds.insert(key)
+        }
+    }
 
     private func checkPressure() {
         guard prefs.alertsEnabled, pressure == .critical, Date().timeIntervalSince(lastPressureAlert) > 600 else { return }
@@ -372,9 +444,9 @@ final class Monitor: ObservableObject {
         if alert?.processName == processName { dismissAlert() }
     }
 
-    func showMemory() {
+    func show(_ target: ListTab) {
         withAnimation(.snappy(duration: 0.25)) { expanded = true }
-        tab = .memory
+        tab = target
         dismissAlert()
     }
 

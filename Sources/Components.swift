@@ -7,6 +7,12 @@ func level(_ v: Double) -> Color {
     v < 0.6 ? .green : v < 0.85 ? .orange : .red
 }
 
+/// Apple Silicon runs comfortably up to ~70°C and throttles in the 90s.
+func temperatureColor(_ celsius: Double?) -> Color {
+    guard let celsius else { return .secondary }
+    return celsius < 70 ? .green : celsius < 85 ? .orange : .red
+}
+
 private let byteFormatter: ByteCountFormatter = {
     let f = ByteCountFormatter()
     f.countStyle = .memory

@@ -8,6 +8,8 @@ struct MonitorAlert: Identifiable, Equatable {
     /// Set for runaway-process alerts, which offer Quit / Ignore.
     let pid: pid_t?
     let processName: String?
+    /// Where "Show" leads for alerts without a process.
+    var tab = ListTab.memory
 }
 
 /// Flags a process that stays above 80% CPU for 2 minutes. Each process is reported once per busy streak.

@@ -4,13 +4,15 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="$HOME/Applications/Glass Monitor.app"
-pkill -x GlassMonitor 2>/dev/null || true
+# Assemble and sign the bundle in a temporary folder, then move it into place: macOS can refuse
+# writes into a freshly created bundle under ~/Applications.
+STAGE="$(mktemp -d)/Glass Monitor.app"
+trap 'rm -rf "$(dirname "$STAGE")"' EXIT
 
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
-swiftc -O -swift-version 5 -target arm64-apple-macos26.0 Sources/*.swift -o "$APP/Contents/MacOS/GlassMonitor"
+mkdir -p "$STAGE/Contents/MacOS"
+swiftc -O -swift-version 5 -target arm64-apple-macos26.0 Sources/*.swift -o "$STAGE/Contents/MacOS/GlassMonitor"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$STAGE/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -27,7 +29,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-codesign --force --sign - "$APP"
+codesign --force --sign - "$STAGE"
+
+pkill -x GlassMonitor 2>/dev/null || true
+mkdir -p "$(dirname "$APP")"
+rm -rf "$APP"
+mv "$STAGE" "$APP"
 # With "Open at Login" on, restart through the login agent so crash auto-restart stays active.
 LOGIN="gui/$(id -u)/com.elabidi.glassmonitor.login"
 if launchctl print "$LOGIN" >/dev/null 2>&1; then launchctl kickstart -k "$LOGIN"; else open "$APP"; fi

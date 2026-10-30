@@ -3,7 +3,8 @@
 Glass Monitor is a small macOS menu-less agent app: a Liquid Glass pill floating at the top-right of
 the screen with live CPU / GPU / RAM / swap / disk / network, which expands into a panel listing the
 processes eating resources (with Quit / Force Quit / admin kill), a 7-day History tab ("why was my Mac
-slow at 3pm?"), runaway-CPU and memory-leak alerts, a Dev tab (Laravel log errors per project, Docker
+slow at 3pm?"), CPU/GPU temperatures, fan speed, battery health, runaway-CPU / memory-leak /
+custom-threshold alerts, a Dev tab (Laravel log errors per project, Docker
 containers, listening ports) and a developer-cache cleaner. Plain SwiftUI + AppKit + Swift Charts +
 SQLite, built with `swiftc` (no Xcode project).
 
@@ -17,8 +18,9 @@ SQLite, built with `swiftc` (no Xcode project).
    ```bash
    ./build.sh
    ```
-   This compiles `Sources/*.swift`, creates `~/Applications/Glass Monitor.app`, ad-hoc codesigns it and
-   launches it (through the login agent when that is loaded). It kills any running copy first.
+   This compiles `Sources/*.swift`, assembles and ad-hoc codesigns the bundle in a temp folder, replaces
+   `~/Applications/Glass Monitor.app` with it and launches it (through the login agent when that is
+   loaded), killing the running copy just before the swap.
    If the sandbox blocks writing to `~/Applications` ("operation not permitted"), rerun it unsandboxed.
 3. Turn on "Open at Login" (also gives crash auto-restart):
    ```bash
@@ -55,6 +57,11 @@ defaults delete com.elabidi.glassmonitor
 - Click the pill to expand; ⌥⌘M toggles from anywhere. Drag it to move it (any screen); position is
   remembered. Right-click for settings (pill items, opacity, click-through, hide in full screen,
   hide from screen sharing, runaway & leak alerts, open at login, move to screen, quit).
+- Sensors row under the status line: average CPU and GPU temperature, fan speed ("Fans off" when idle),
+  battery health and cycle count (from `system_profiler -json SPPowerDataType`, refreshed every 30 min).
+  The battery status shows time left / time to full. "TEMP" can be added to the pill.
+- "Alert When…" (right-click menu): memory %, swap GB, disk %, CPU °C limits. Defaults: swap 8 GB,
+  disk 95%, others off. Each fires once and re-arms after the value drops back.
 - History tab: 1h / 6h / 24h / 7d chart of CPU and memory. Hover a minute to see which apps were
   using it, click to pin; with nothing selected the list is the range average.
 - Memory-leak alert: a process grows ≥500 MB and ≥50% over an hour with every 10-minute average rising.
@@ -74,7 +81,8 @@ defaults delete com.elabidi.glassmonitor
 | `LoginItem.swift` | Per-user launch agent (login + crash restart), migration from old SMAppService items, single-instance logic |
 | `History.swift` | SQLite store (`~/Library/Application Support/GlassMonitor/history.sqlite`, 7-day retention) + `Timeline` model |
 | `HistoryView.swift` | History tab (Swift Charts, hover/pin) |
-| `Stats.swift` | CPU ticks, memory/swap/pressure, disk space & I/O, GPU, network, battery (Mach/sysctl/IOKit) |
+| `Stats.swift` | CPU ticks, memory/swap/pressure, disk space & I/O, GPU, network, battery power/time/health (Mach/sysctl/IOKit) |
+| `Sensors.swift` | Temperatures and fans from the SMC (`AppleSMC` IOKit user client; no public API exists) |
 | `Processes.swift` | `ps` sampling, per-process disk/net rates, app grouping, icon cache |
 | `Monitor.swift` | `ObservableObject` model, 1.5 s tick, per-minute history recording, kill/dev/clean actions |
 | `Alerts.swift` | Runaway-CPU and memory-leak detectors + notifications (Quit / Ignore actions) |
@@ -97,6 +105,9 @@ defaults delete com.elabidi.glassmonitor
 - **Don't go back to `SMAppService.agent` / `.mainApp`.** build.sh replaces the bundle on every build and
   SMAppService then can't spawn it (launchd: `last exit code = 78: EX_CONFIG`, forever). The plain
   `~/Library/LaunchAgents` plist with an absolute path survives rebuilds.
+- SMC: keys are enumerated once at launch on a background queue (≈0.4–0.8 s); only `flt ` keys with
+  prefixes Tp/Te (CPU), Tg (GPU), F*Ac (fans) are read, ≈8 ms every 6 s. The `Param` struct must stay
+  80 bytes with the explicit padding fields, or every call fails.
 - History is recorded once a minute from the existing process sample; the chart lives in its own
   `Timeline` ObservableObject so hovering doesn't redraw the whole panel.
 - Build is plain `swiftc` with `-swift-version 5`; top-level code must stay in `main.swift`.

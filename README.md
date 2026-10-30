@@ -1,11 +1,12 @@
 # Glass Monitor
 
 A Liquid Glass system monitor pill for macOS 26. It floats at the top-right of the screen and shows live
-CPU, GPU, RAM, swap, disk and network usage. Click it to expand a panel with:
+CPU, GPU, RAM, swap, disk, network and temperature. Click it to expand a panel with:
 
 - **Processes** by CPU, memory, disk or network, grouped by app, with Quit / Force Quit / admin kill
 - **History**: 7 days of per-minute CPU and memory, plus which apps were using them at any moment
-- **Alerts** for runaway CPU and memory leaks
+- **Sensors**: CPU/GPU temperature, fan speed, battery health, cycle count and time remaining
+- **Alerts** for runaway CPU, memory leaks and your own limits (memory, swap, disk, temperature)
 - **Dev**: Laravel log errors per project, Docker containers, listening ports
 - **Clean**: developer caches (DerivedData, npm, Composer, Docker images…), moved to the Trash
 

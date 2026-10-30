@@ -4,7 +4,7 @@ import AppKit
 struct RootView: View {
     static let pillHeight: CGFloat = 38
     static let alertHeight: CGFloat = 52
-    static let expandedSize = CGSize(width: 500, height: 744)
+    static let expandedSize = CGSize(width: 500, height: 764)
 
     static func pillWidth(_ items: [PillItem]) -> CGFloat {
         46 + items.reduce(0) { $0 + $1.width } + CGFloat(items.count) * 10
@@ -73,6 +73,10 @@ struct RootView: View {
         case .ram: MetricChip(label: "RAM", ring: m.memFraction, color: m.pressure.color, text: percent(m.memFraction))
         case .swap: MetricChip(label: "SWAP", ring: m.swapLevel, color: m.swapColor, text: gigabytes(m.swapUsed))
         case .disk: MetricChip(label: "DISK", ring: m.diskFraction, text: percent(m.diskFraction))
+        case .temp:
+            let cpu = m.sensors.cpu
+            MetricChip(label: "TEMP", ring: (cpu ?? 0) / 100, color: temperatureColor(cpu),
+                       text: cpu.map { "\(Int($0.rounded()))°" } ?? "—")
         case .net: MetricChip(label: "NET", text: "↓\(shortBytes(m.netIn)) ↑\(shortBytes(m.netOut))")
         }
     }
@@ -81,7 +85,10 @@ struct RootView: View {
 
     private var details: some View {
         VStack(spacing: 10) {
-            statusStrip
+            VStack(spacing: 5) {
+                statusStrip
+                sensorStrip
+            }
             tiles
             TabBar(m: m)
             Group {
@@ -113,6 +120,32 @@ struct RootView: View {
         .font(.system(size: 10.5, weight: .medium))
     }
 
+    /// Temperatures, fans and battery wear.
+    private var sensorStrip: some View {
+        HStack(spacing: 12) {
+            status(temperatureColor(m.sensors.cpu), "cpu",
+                   "CPU " + (m.sensors.cpu.map { "\(Int($0.rounded()))°C" } ?? "—"))
+            if let gpu = m.sensors.gpu {
+                status(temperatureColor(gpu), "square.grid.3x3.fill", "GPU \(Int(gpu.rounded()))°C")
+            }
+            if let rpm = m.sensors.fanRPM {
+                status(fanColor(rpm), "fan.fill", rpm < 1 ? "Fans off" : "Fans \(rpm.formatted(.number.precision(.fractionLength(0)))) rpm")
+            }
+            Spacer(minLength: 0)
+            if let battery = m.battery, let capacity = battery.maxCapacity {
+                status(capacity >= 80 ? .green : .orange, "minus.plus.batteryblock",
+                       "Health \(capacity)%" + (battery.cycles.map { " · \($0) cycles" } ?? ""))
+                    .help("Battery condition: \(battery.condition ?? "unknown") — as shown in System Information")
+            }
+        }
+        .font(.system(size: 10.5, weight: .medium))
+    }
+
+    private func fanColor(_ rpm: Double) -> Color {
+        guard let max = m.sensors.fanMaxRPM, max > 0 else { return .secondary }
+        return level(rpm / max)
+    }
+
     private func status(_ color: Color, _ symbol: String, _ text: String) -> some View {
         HStack(spacing: 4) {
             Image(systemName: symbol).font(.system(size: symbol == "circle.fill" ? 6 : 10)).foregroundStyle(color)
@@ -123,8 +156,9 @@ struct RootView: View {
 
     private func powerText(_ p: PowerInfo) -> String {
         let battery = p.percent.map { " · \($0)%" } ?? ""
-        if p.onBattery { return String(format: "%.1f W", p.watts) + battery }
-        return (p.charging ? "Charging" : "On power") + battery
+        let remaining = p.minutesRemaining.map { " · \($0 / 60):\(String(format: "%02d", $0 % 60)) \(p.onBattery ? "left" : "to full")" } ?? ""
+        if p.onBattery { return String(format: "%.1f W", p.watts) + battery + remaining }
+        return (p.charging ? "Charging" : "On power") + battery + remaining
     }
 
     private var historyToggle: some View {
@@ -228,7 +262,7 @@ struct AlertBanner: View {
                 PillButton("Quit", .red) { m.quitAlertProcess() }
                 PillButton("Ignore") { m.ignore(processName: name) }
             } else {
-                PillButton("Show") { m.showMemory() }
+                PillButton("Show") { m.show(alert.tab) }
             }
             Button { m.dismissAlert() } label: {
                 Image(systemName: "xmark").font(.system(size: 9, weight: .bold))
@@ -264,6 +298,33 @@ struct SettingsMenu: View {
         Toggle("Hide in Full-Screen Apps", isOn: $prefs.hideInFullScreen)
         Toggle("Hide from Screen Sharing & Recordings", isOn: $prefs.hideFromSharing)
         Toggle("Runaway CPU & Memory Leak Alerts", isOn: $prefs.alertsEnabled)
+        Menu("Alert When…") {
+            Picker("Memory Above", selection: $prefs.ramAlert) {
+                Text("Off").tag(0.0)
+                Text("85%").tag(0.85)
+                Text("90%").tag(0.9)
+                Text("95%").tag(0.95)
+            }
+            Picker("Swap Above", selection: $prefs.swapAlertGB) {
+                Text("Off").tag(0.0)
+                Text("2 GB").tag(2.0)
+                Text("4 GB").tag(4.0)
+                Text("8 GB").tag(8.0)
+            }
+            Picker("Disk Above", selection: $prefs.diskAlert) {
+                Text("Off").tag(0.0)
+                Text("85%").tag(0.85)
+                Text("90%").tag(0.9)
+                Text("95%").tag(0.95)
+            }
+            Picker("CPU Temperature Above", selection: $prefs.tempAlert) {
+                Text("Off").tag(0.0)
+                Text("80°C").tag(80.0)
+                Text("90°C").tag(90.0)
+                Text("95°C").tag(95.0)
+            }
+        }
+        .disabled(!prefs.alertsEnabled)
         Toggle("Open at Login", isOn: Binding(get: { LoginItem.isEnabled }, set: { LoginItem.setEnabled($0) }))
         Divider()
         Menu("Move to Screen") {
