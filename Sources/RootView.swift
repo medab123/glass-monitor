@@ -21,8 +21,10 @@ struct RootView: View {
                       height: CGFloat(rows) * cell.height + CGFloat(rows - 1) * cellSpacing.height + cardPadding * 2)
     }
 
+    /// Must fit the header exactly: if its content is wider than the window, the glass is wider too and the
+    /// window cuts off its round ends. Fixed part: 28 padding + »/eye/power/chevron (≈56) + 4 × 10 spacing.
     static func pillWidth(_ items: [PillItem]) -> CGFloat {
-        106 + items.reduce(0) { $0 + $1.width } + CGFloat(items.count) * 10
+        126 + items.reduce(0) { $0 + $1.width } + CGFloat(items.count) * 10
     }
 
     /// The edge card only shows while collapsed with no alert; an alert brings the full pill back.
