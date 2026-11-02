@@ -89,8 +89,10 @@ let output = URL(fileURLWithPath: CommandLine.arguments.count > 1 ? CommandLine.
 let iconset = FileManager.default.temporaryDirectory.appendingPathComponent("AppIcon.iconset")
 try? FileManager.default.removeItem(at: iconset)
 try! FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)
+// Up to 512 px: the 1024 px image (512@2x) is half the .icns size and only shows in huge Finder icon views,
+// where macOS scales the 512 one up instead.
 for base in [16, 32, 128, 256, 512] {
-    for scale in [1, 2] {
+    for scale in [1, 2] where base * scale <= 512 {
         let name = scale == 1 ? "icon_\(base)x\(base).png" : "icon_\(base)x\(base)@2x.png"
         let png = draw(size: CGFloat(base * scale)).representation(using: .png, properties: [:])!
         try! png.write(to: iconset.appendingPathComponent(name))

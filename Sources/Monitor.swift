@@ -72,16 +72,17 @@ struct Series: Codable {
     private var peaks = [Double](repeating: -.infinity, count: GraphRange.allCases.count)
     private var peakLabels = [String](repeating: "", count: GraphRange.allCases.count)
 
-    mutating func add(_ value: Double, label: String? = nil) {
+    /// `weight` = how many 1.5 s samples this one stands for (2 for a 3 s collapsed tick).
+    mutating func add(_ value: Double, label: String? = nil, weight: Int = 1) {
         for range in GraphRange.allCases {
             let i = range.index
-            sums[i] += value
-            counts[i] += 1
+            sums[i] += value * Double(weight)
+            counts[i] += weight
             if let label, value >= peaks[i] {
                 peaks[i] = value
                 peakLabels[i] = label
             }
-            guard counts[i] == range.bucket else { continue }
+            guard counts[i] >= range.bucket else { continue }
             append(sums[i] / Double(counts[i]), label: peakLabels[i], at: i)
             resetBucket(i)
         }
@@ -227,7 +228,14 @@ final class Monitor: ObservableObject {
         didSet {
             confirmKey = nil
             adminKey = nil
-            if expanded { refreshTab() }
+            guard expanded != oldValue else { return }
+            scheduleTimer()
+            if expanded {
+                refreshTab()
+            } else {
+                // Hand the panel's freed memory (views, icons, chart data) back to macOS instead of keeping it.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { malloc_zone_pressure_relief(nil, 0) }
+            }
         }
     }
     @Published var tab = ListTab.cpu {
@@ -283,7 +291,8 @@ final class Monitor: ObservableObject {
     private let leaks = LeakDetector()
     let timeline = Timeline()
     /// Sums over the current minute, averaged into one history row.
-    private var minute = (cpu: 0.0, memory: 0.0, samples: 0)
+    /// Time-weighted sums over the current minute, averaged into one history row.
+    private var minute = (cpu: 0.0, memory: 0.0, seconds: 0.0)
     private var lastLaravelScan = Date.distantPast
     private var lastPressureAlert = Date.distantPast
     private var lastPressureWarning = Date.distantPast
@@ -302,7 +311,9 @@ final class Monitor: ObservableObject {
     private var lastIO: (read: UInt64, write: UInt64)?
     private var lastNet: (received: UInt64, sent: UInt64)?
     private var lastSample = Date()
-    private var tickCount = 0
+    /// When each periodic job last ran (see `due`).
+    private var lastRun: [Job: Date] = [:]
+    private enum Job { case disk, power, sensors, selfUsage, network, saveGraphs, advice, battery, processes, dev }
     private var timer: Timer?
     /// Background jobs in flight (main-thread only), so slow tools never pile up.
     private var busy = Set<String>()
@@ -323,8 +334,31 @@ final class Monitor: ObservableObject {
             }
         }
         tick()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in self?.tick() }
+        scheduleTimer()
     }
+
+    /// Collapsed, only the pill is on screen, so it refreshes every 3 s; the open panel every 2 s (each refresh
+    /// redraws the whole panel, ≈2.5% CPU at 1.5 s).
+    private var interval: TimeInterval { expanded ? 2 : 3 }
+
+    private func scheduleTimer() {
+        timer?.invalidate()
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in self?.tick() }
+        // Lets macOS batch this wake-up with others (less CPU wake-ups, less energy).
+        timer.tolerance = interval / 5
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    /// True (and restarts the clock) when `job` hasn't run for `seconds`.
+    private func due(_ job: Job, every seconds: TimeInterval, _ now: Date) -> Bool {
+        if let last = lastRun[job], now.timeIntervalSince(last) < seconds - 0.2 { return false }
+        lastRun[job] = now
+        return true
+    }
+
+    /// Temperatures are only read when something shows or uses them.
+    private var needsSensors: Bool { expanded || prefs.pillItems.contains(.temp) || prefs.tempAlert > 0 }
 
     // MARK: Sampling
 
@@ -350,24 +384,25 @@ final class Monitor: ObservableObject {
         thermal = ProcessInfo.processInfo.thermalState
         gpu = SystemStats.gpuUtilization()
         // Free space is costly to compute (purgeable space accounting) and changes slowly.
-        if tickCount % 20 == 0 {
+        if due(.disk, every: 30, now) {
             (diskUsed, diskTotal) = SystemStats.disk()
             checkDiskSpace()
         }
-        if tickCount % 4 == 0 { measureSelf(now) }
-        if expanded && tab == .network && tickCount % 4 == 2 { readNetwork() }
-        if tickCount % 40 == 39 { history.save() }
-        if tickCount % 4 == 0 {
+        // Things only the open panel shows are refreshed less often while collapsed.
+        if due(.selfUsage, every: expanded ? 6 : 60, now) { measureSelf(now) }
+        if expanded && tab == .network && due(.network, every: 6, now) { readNetwork() }
+        if due(.saveGraphs, every: 300, now) { history.save() }
+        if due(.power, every: expanded ? 6 : 30, now) {
             power = SystemStats.power()
-            readSensors()
             checkThresholds()
         }
-        if tickCount % 40 == 20 {
+        if needsSensors && due(.sensors, every: 6, now) { readSensors() }
+        if due(.advice, every: 60, now) {
             checkRestartAdvice()
             checkWeeklyReport()
         }
-        // Battery wear changes over weeks; refresh every 30 minutes.
-        if tickCount % 1_200 == 0 && power != nil { refreshBatteryHealth() }
+        // Battery wear changes over weeks.
+        if power != nil && due(.battery, every: 1_800, now) { refreshBatteryHealth() }
 
         let io = SystemStats.diskIOBytes()
         // Counters drop when a disk or disk image is detached; skip that sample instead of wrapping around.
@@ -384,27 +419,31 @@ final class Monitor: ObservableObject {
         }
         lastNet = net
 
-        history.cpu.add(cpu, label: cpuCulprit)
-        history.gpu.add(gpu ?? 0)
-        history.memory.add(memFraction, label: memoryCulprit)
-        history.swap.add(swapLevel)
-        history.io.add(readRate + writeRate)
-        history.network.add(netIn + netOut)
+        // Graph points average 1.5 s samples; a longer tick counts as several. One publish for all six series.
+        let weight = max(1, Int((dt / 1.5).rounded()))
+        var graphs = history
+        graphs.cpu.add(cpu, label: cpuCulprit, weight: weight)
+        graphs.gpu.add(gpu ?? 0, weight: weight)
+        graphs.memory.add(memFraction, label: memoryCulprit, weight: weight)
+        graphs.swap.add(swapLevel, weight: weight)
+        graphs.io.add(readRate + writeRate, weight: weight)
+        graphs.network.add(netIn + netOut, weight: weight)
+        history = graphs
 
         checkPressure()
 
-        minute.cpu += cpu
-        minute.memory += memFraction
-        minute.samples += 1
-        // One history row a minute (40 × 1.5 s), using the process list sampled just before.
-        if minute.samples >= 40 { recordMinute() }
+        minute.cpu += cpu * dt
+        minute.memory += memFraction * dt
+        minute.seconds += dt
+        // One history row a minute, using the latest process sample.
+        if minute.seconds >= 60 { recordMinute() }
 
+        // The process list is the biggest job (ps + one syscall per process): every 4 s while a process tab is
+        // open, otherwise only as often as the alerts and the minute history need it.
         let showingProcesses = expanded && tab.isProcessMetric
-        if showingProcesses ? tickCount % 2 == 0 : (prefs.alertsEnabled && tickCount % 4 == 0) || minute.samples == 38 {
-            sampleProcesses()
-        }
-        if expanded && tab == .dev && tickCount % 4 == 0 { refreshDev() }
-        tickCount += 1
+        if due(.processes, every: showingProcesses ? 4 : prefs.alertsEnabled ? 15 : 60, now) { sampleProcesses() }
+        // Docker CLI calls cost real CPU (`docker stats` especially).
+        if expanded && tab == .dev && due(.dev, every: 10, now) { refreshDev() }
     }
 
     private func refreshTab() {
@@ -467,14 +506,14 @@ final class Monitor: ObservableObject {
     }
 
     private func recordMinute() {
-        let samples = Double(minute.samples)
+        let seconds = max(minute.seconds, 1)
         let groups = Dictionary(grouping: processes, by: \.groupKey).map { AppGroup(id: $0.key, processes: $0.value) }
         let kept = Set(groups.sorted { $0.metrics.cpu > $1.metrics.cpu }.prefix(10).map(\.id))
             .union(groups.sorted { $0.metrics.mem > $1.metrics.mem }.prefix(10).map(\.id))
         let apps = groups.filter { kept.contains($0.id) }.map {
             HistoryApp(id: $0.id, name: $0.name, bundlePath: $0.bundlePath, cpu: $0.metrics.cpu, memBytes: $0.metrics.mem)
         }
-        timeline.store.record(at: Date(), cpu: minute.cpu / samples, memory: minute.memory / samples, swap: swapUsed, apps: apps)
+        timeline.store.record(at: Date(), cpu: minute.cpu / seconds, memory: minute.memory / seconds, swap: swapUsed, apps: apps)
         minute = (0, 0, 0)
         if expanded && tab == .history && timeline.selected == nil { timeline.reload() }
 

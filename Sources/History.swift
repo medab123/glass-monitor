@@ -77,11 +77,40 @@ final class HistoryStore {
             .appendingPathComponent("GlassMonitor", isDirectory: true)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         guard sqlite3_open(folder.appendingPathComponent("history.sqlite").path, &db) == SQLITE_OK else { db = nil; return }
+        // Incremental auto-vacuum lets pruning give space back to the disk (applies to new files, or after VACUUM).
         exec("""
+            PRAGMA auto_vacuum = INCREMENTAL;
             PRAGMA journal_mode = WAL;
+            PRAGMA journal_size_limit = 1048576;
             CREATE TABLE IF NOT EXISTS samples (ts INTEGER PRIMARY KEY, cpu REAL, memory REAL, swap INTEGER);
-            CREATE TABLE IF NOT EXISTS apps (ts INTEGER, key TEXT, name TEXT, bundle TEXT, cpu REAL, mem INTEGER);
-            CREATE INDEX IF NOT EXISTS apps_ts ON apps (ts);
+            CREATE TABLE IF NOT EXISTS app_names (id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, name TEXT, bundle TEXT);
+            CREATE TABLE IF NOT EXISTS app_usage (ts INTEGER NOT NULL, app INTEGER NOT NULL, cpu REAL, mem INTEGER,
+                                                  PRIMARY KEY (ts, app)) WITHOUT ROWID;
+            """)
+        if tableExists("apps") { migrateApps() }
+        // Readers keep querying `apps`; names and paths are stored once in app_names instead of on every row.
+        exec("""
+            CREATE VIEW IF NOT EXISTS apps AS
+            SELECT u.ts AS ts, n.key AS key, n.name AS name, n.bundle AS bundle, u.cpu AS cpu, u.mem AS mem
+            FROM app_usage u JOIN app_names n ON n.id = u.app;
+            """)
+    }
+
+    private func tableExists(_ name: String) -> Bool {
+        !rows("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [name]) { _ in true }.isEmpty
+    }
+
+    /// Builds before 1.1 stored key, name and bundle path on every row (~150 bytes); move them to app_names.
+    private func migrateApps() {
+        exec("""
+            BEGIN;
+            INSERT OR IGNORE INTO app_names (key, name, bundle) SELECT key, max(name), max(bundle) FROM apps GROUP BY key;
+            INSERT OR REPLACE INTO app_usage
+                SELECT a.ts, n.id, max(a.cpu), max(a.mem) FROM apps a JOIN app_names n ON n.key = a.key GROUP BY a.ts, n.id;
+            DROP TABLE apps;
+            COMMIT;
+            VACUUM;
+            PRAGMA wal_checkpoint(TRUNCATE);
             """)
     }
 
@@ -92,15 +121,23 @@ final class HistoryStore {
             self.exec("BEGIN")
             self.run("INSERT OR REPLACE INTO samples VALUES (?, ?, ?, ?)", [ts, cpu, memory, Int64(swap)])
             for app in apps {
-                self.run("INSERT INTO apps VALUES (?, ?, ?, ?, ?, ?)",
-                         [ts, app.id, app.name, app.bundlePath, app.cpu, Int64(app.memBytes)])
+                // Only writes the name row when it's new or changed.
+                self.run("""
+                    INSERT INTO app_names (key, name, bundle) VALUES (?1, ?2, ?3) ON CONFLICT (key) DO UPDATE
+                    SET name = excluded.name, bundle = excluded.bundle
+                    WHERE name IS NOT excluded.name OR bundle IS NOT excluded.bundle
+                    """, [app.id, app.name, app.bundlePath])
+                self.run("INSERT OR REPLACE INTO app_usage SELECT ?1, id, ?2, ?3 FROM app_names WHERE key = ?4",
+                         [ts, app.cpu, Int64(app.memBytes), app.id])
             }
             self.exec("COMMIT")
             if date.timeIntervalSince(self.lastPrune) > 3_600 {
                 self.lastPrune = date
                 let cutoff = ts - Int64(Self.retention)
                 self.run("DELETE FROM samples WHERE ts < ?", [cutoff])
-                self.run("DELETE FROM apps WHERE ts < ?", [cutoff])
+                self.run("DELETE FROM app_usage WHERE ts < ?", [cutoff])
+                self.exec("DELETE FROM app_names WHERE id NOT IN (SELECT DISTINCT app FROM app_usage)")
+                self.exec("PRAGMA incremental_vacuum; PRAGMA wal_checkpoint(TRUNCATE)")
             }
         }
     }

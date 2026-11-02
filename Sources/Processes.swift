@@ -171,14 +171,33 @@ enum ProcessList {
     }
 }
 
-/// Main-thread icon cache keyed by bundle path.
+/// Main-thread icon cache keyed by bundle path. Keeps a 44 px (22 pt @2x) thumbnail of each icon rather than
+/// the full icon, which carries every size up to 1024 px and costs megabytes once drawn.
 enum Icons {
+    private static let points = NSSize(width: 22, height: 22)
     private static var cache: [String: NSImage] = [:]
 
     static func app(_ bundlePath: String) -> NSImage {
         if let cached = cache[bundlePath] { return cached }
-        let image = NSWorkspace.shared.icon(forFile: bundlePath)
+        if cache.count > 200 { cache.removeAll() }
+        let image = thumbnail(NSWorkspace.shared.icon(forFile: bundlePath))
         cache[bundlePath] = image
+        return image
+    }
+
+    private static func thumbnail(_ icon: NSImage) -> NSImage {
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(points.width * 2),
+                                            pixelsHigh: Int(points.height * 2), bitsPerSample: 8, samplesPerPixel: 4,
+                                            hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                                            bytesPerRow: 0, bitsPerPixel: 0) else { return icon }
+        bitmap.size = points
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
+        NSGraphicsContext.current?.imageInterpolation = .high
+        icon.draw(in: NSRect(origin: .zero, size: points))
+        NSGraphicsContext.restoreGraphicsState()
+        let image = NSImage(size: points)
+        image.addRepresentation(bitmap)
         return image
     }
 }

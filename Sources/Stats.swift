@@ -197,9 +197,7 @@ enum SystemStats {
     }
 
     static func power() -> PowerInfo? {
-        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
-        guard service != 0 else { return nil }
-        defer { IOObjectRelease(service) }
+        guard let service = services("AppleSmartBattery").first else { return nil }
         let millivolts = (property(service, "Voltage") as? NSNumber)?.doubleValue ?? 0
         // Amperage is a signed value (negative while discharging) that can surface as a wrapped unsigned number.
         let milliamps = Double((property(service, "InstantAmperage") as? NSNumber)?.int64Value ?? 0)
@@ -239,14 +237,25 @@ enum SystemStats {
     // MARK: IOKit helpers
 
     private static func forEachService(_ className: String, _ body: (io_object_t) -> Void) {
+        services(className).forEach(body)
+    }
+
+    /// Matched services per class, kept for a minute: matching walks the whole IORegistry, which is the costly
+    /// part of reading GPU, disk and battery stats every tick. Re-matching picks up added or removed disks.
+    /// Main thread only.
+    private static var serviceCache: [String: (services: [io_object_t], at: Date)] = [:]
+
+    private static func services(_ className: String) -> [io_object_t] {
+        if let cached = serviceCache[className], Date().timeIntervalSince(cached.at) < 60 { return cached.services }
+        serviceCache[className]?.services.forEach { IOObjectRelease($0) }
+        var found: [io_object_t] = []
         var iterator: io_iterator_t = 0
-        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(className), &iterator) == KERN_SUCCESS
-        else { return }
-        defer { IOObjectRelease(iterator) }
-        while case let service = IOIteratorNext(iterator), service != 0 {
-            body(service)
-            IOObjectRelease(service)
+        if IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(className), &iterator) == KERN_SUCCESS {
+            while case let service = IOIteratorNext(iterator), service != 0 { found.append(service) }
+            IOObjectRelease(iterator)
         }
+        serviceCache[className] = (found, Date())
+        return found
     }
 
     private static func property(_ service: io_object_t, _ key: String) -> Any? {

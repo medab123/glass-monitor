@@ -33,7 +33,8 @@ SQLite, built with `swiftc` (no Xcode project).
 4. Verify:
    - `pgrep -lx GlassMonitor` shows exactly one process.
    - `launchctl print gui/$(id -u)/com.elabidi.glassmonitor.login | grep -E 'state|pid'` → running.
-   - CPU cost: `top -l 2 -pid $(pgrep -x GlassMonitor) -stats cpu` should be ≈0.4–1% collapsed.
+   - CPU cost: `top -l 2 -pid $(pgrep -x GlassMonitor) -stats cpu` should be ≈0.6% collapsed (≈3% open);
+     memory ≈20 MB collapsed (`footprint $(pgrep -x GlassMonitor)`).
    - After a minute, `sqlite3 ~/Library/Application\ Support/GlassMonitor/history.sqlite 'SELECT count(*) FROM samples'` ≥ 1.
    - The first time the Dev tab opens, macOS asks "Glass Monitor would like to access files in your
      Documents folder" (the Laravel log scan). Tell the user to click **Allow**; until then that section
@@ -154,6 +155,20 @@ defaults delete com.elabidi.glassmonitor
   80 bytes with the explicit padding fields, or every call fails.
 - History is recorded once a minute from the existing process sample; the chart lives in its own
   `Timeline` ObservableObject so hovering doesn't redraw the whole panel.
+- **Refresh is time-based, not tick-based**: the timer runs every 3 s collapsed and 2 s open (`interval`,
+  with tolerance for coalesced wake-ups); periodic jobs use `due(_:every:)`. Graph series take a `weight`
+  (samples per 1.5 s) so their time axis stays right at either rate. Don't go back to `tickCount % n`.
+- Collapsed, things only the panel shows are read rarely or not at all: self usage every 60 s, power 30 s,
+  sensors only when the panel is open / TEMP is in the pill / a temperature alert is set, processes every
+  15 s (alerts) or 60 s. IOKit services are matched once a minute and reused (`SystemStats.services`).
+- **Memory**: icons are cached as 44 px thumbnails (full NSWorkspace icons cost MBs once drawn), and on
+  collapse `malloc_zone_pressure_relief` returns the panel's freed memory to macOS (peak was 144 MB).
+- **History DB layout**: `samples`, `app_names` (key/name/bundle once) and `app_usage` (ts, app id, cpu, mem;
+  WITHOUT ROWID), with a view named `apps` so queries read like the old table. Older databases are migrated
+  on open (`migrateApps`, then VACUUM + checkpoint): 2.7 MB → 0.7 MB. auto_vacuum is incremental, so the
+  hourly prune gives space back. Graphs are saved every 5 minutes and on quit.
+- build.sh strips local symbols (binary 2.5 → 1.2 MB) and keeps `.build/GlassMonitor.unstripped` for
+  symbolicating crash reports. The .icns stops at 512 px (1.36 MB → 0.59 MB).
 - **Helper tools are the expensive part**: `top` (Energy tab) costs ~1 s of CPU per run, so its results are
   cached for 6 s; `nettop` (Network tab) runs every 3 s. Wi-Fi and energy are only read while their tab is open.
 - **Graph history can contain NaN** (gaps while the app wasn't running): filter with `isFinite` before

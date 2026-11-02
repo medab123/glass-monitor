@@ -91,11 +91,19 @@ final class SMCSensors {
             }
         }
         // Drop sensors that aren't wired up on this model (they read 0 or nonsense).
-        cpuKeys = cpuKeys.filter { value($0).map(Self.plausible) ?? false }
-        gpuKeys = gpuKeys.filter { value($0).map(Self.plausible) ?? false }
+        cpuKeys = Self.spread(cpuKeys.filter { value($0).map(Self.plausible) ?? false })
+        gpuKeys = Self.spread(gpuKeys.filter { value($0).map(Self.plausible) ?? false })
     }
 
     private static func plausible(_ celsius: Double) -> Bool { celsius > 5 && celsius < 130 }
+
+    /// At most 12 sensors spread across the die: their average is within a degree of all ~60, at a fifth of
+    /// the IOKit calls per read.
+    private static func spread(_ keys: [Key], limit: Int = 12) -> [Key] {
+        guard keys.count > limit else { return keys }
+        let step = Double(keys.count) / Double(limit)
+        return (0..<limit).map { keys[Int(Double($0) * step)] }
+    }
 
     private func average(_ keys: [Key]) -> Double? {
         let values = keys.compactMap(value).filter(Self.plausible)

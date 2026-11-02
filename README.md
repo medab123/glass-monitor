@@ -123,7 +123,8 @@ Open Activity Monitor.
 - **Open at Login**, with automatic restart within about 2 seconds if it ever crashes. Quitting it yourself
   keeps it closed until your next login.
 - Only one copy runs at a time.
-- About **1% CPU** while collapsed. Docker, port and log scans only run while the Dev tab is open.
+- About **0.6% CPU and 20 MB of memory** while collapsed (about 3% and 35 MB with the panel open), a
+  1.7 MB app and under 1 MB of history. Docker, port and log scans only run while the Dev tab is open.
 
 ## Privacy
 

@@ -11,6 +11,11 @@ trap 'rm -rf "$(dirname "$STAGE")"' EXIT
 
 mkdir -p "$STAGE/Contents/MacOS"
 swiftc -O -swift-version 5 -target arm64-apple-macos26.0 Sources/*.swift -o "$STAGE/Contents/MacOS/GlassMonitor"
+# Strip local symbols: halves the binary. The unstripped copy stays in .build/ to symbolicate crash reports
+# (atos -o .build/GlassMonitor.unstripped -arch arm64 -l <load address> <addresses>).
+mkdir -p .build
+cp "$STAGE/Contents/MacOS/GlassMonitor" .build/GlassMonitor.unstripped
+strip -x "$STAGE/Contents/MacOS/GlassMonitor"
 
 cat > "$STAGE/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
