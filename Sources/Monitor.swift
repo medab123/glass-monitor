@@ -242,6 +242,13 @@ final class Monitor: ObservableObject {
     @Published private(set) var openGroups = Set<String>()
     @Published private(set) var docker = DockerState.loading
     @Published private(set) var servers: [ListeningServer] = []
+    /// Docker's VM, Android emulators and other VMs; updated while the Dev tab is open.
+    @Published private(set) var machines: [VirtualMachine] = []
+    @Published private(set) var dockerLimits: (memory: UInt64, cpus: Int)?
+    @Published private(set) var dockerSwitching = false
+    /// nil until scanned from the Clean tab.
+    @Published private(set) var startupItems: [StartupItem]?
+    @Published private(set) var scanningStartup = false
     /// nil until the first scan.
     @Published private(set) var laravel: [LaravelProject]?
     @Published private(set) var scanningLaravel = false
@@ -258,6 +265,17 @@ final class Monitor: ObservableObject {
     var diskFraction: Double { Double(diskUsed) / Double(max(diskTotal, 1)) }
     var swapLevel: Double { min(1, Double(swapUsed) / Self.swapScale) }
     var swapColor: Color { swapUsed < 512 << 20 ? .green : swapUsed < 3 << 30 ? .orange : .red }
+
+    let bootTime = SystemStats.bootTime()
+    var uptime: TimeInterval { bootTime.map { Date().timeIntervalSince($0) } ?? 0 }
+    /// Up for 2+ days with swap at a quarter of RAM (at least 4 GB): swap only shrinks again after a restart.
+    var restartAdvised: Bool {
+        uptime >= 2 * 86_400 && Double(swapUsed) >= max(4 * 1_073_741_824, Double(memTotal) / 4)
+    }
+    var focusOn: Bool { prefs.focusQuit != nil }
+    var dockerDesktopRunning: Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: Docker.desktopBundleID).isEmpty
+    }
 
     private var processes: [ProcInfo] = []
     private let sampler = ProcessSampler()
@@ -344,6 +362,10 @@ final class Monitor: ObservableObject {
             readSensors()
             checkThresholds()
         }
+        if tickCount % 40 == 20 {
+            checkRestartAdvice()
+            checkWeeklyReport()
+        }
         // Battery wear changes over weeks; refresh every 30 minutes.
         if tickCount % 1_200 == 0 && power != nil { refreshBatteryHealth() }
 
@@ -389,7 +411,9 @@ final class Monitor: ObservableObject {
         guard expanded else { return }
         switch tab {
         case .dev: refreshDev()
-        case .clean: if cleanItems.isEmpty { scanClean() }
+        case .clean:
+            if cleanItems.isEmpty { scanClean() }
+            if startupItems == nil { scanStartup() }
         case .history: timeline.reload()
         case .network:
             readNetwork()
@@ -430,6 +454,10 @@ final class Monitor: ObservableObject {
             processes = list
             updateRows()
             updateCulprits()
+            if expanded && tab == .dev {
+                let docker = dockerDesktopRunning
+                machines = list.compactMap { VirtualMachine($0, dockerRunning: docker) }.sorted { $0.memory > $1.memory }
+            }
             if prefs.alertsEnabled, let p = runaway.evaluate(list) {
                 raise(MonitorAlert(title: "\(p.appName ?? p.name) is using \(Int(p.cpu))% CPU",
                                    detail: "\(p.name) (PID \(p.id)) has been busy for over 2 minutes",
@@ -659,22 +687,101 @@ final class Monitor: ObservableObject {
     func show(_ target: ListTab) {
         withAnimation(.snappy(duration: 0.25)) { expanded = true }
         tab = target
+        // Only the weekly report leads to History; open it on the week.
+        if target == .history { timeline.range = .week }
         dismissAlert()
+    }
+
+    /// At most once a day, while `restartAdvised` holds.
+    private func checkRestartAdvice() {
+        let defaults = UserDefaults.standard
+        guard prefs.alertsEnabled, restartAdvised,
+              Date().timeIntervalSince(defaults.object(forKey: "lastRestartAdvice") as? Date ?? .distantPast) > 86_400
+        else { return }
+        defaults.set(Date(), forKey: "lastRestartAdvice")
+        raise(MonitorAlert(title: "Restart recommended · swap is \(bytes(Double(swapUsed)))",
+                           detail: "Up \(duration(uptime)) — a restart clears swap and the Mac will feel faster again",
+                           pid: nil, processName: nil, tab: .memory))
+    }
+
+    /// Mondays from 9:00, once a week: last week's numbers as a notification.
+    private func checkWeeklyReport() {
+        let defaults = UserDefaults.standard
+        let now = Date()
+        guard prefs.alertsEnabled else { return }
+        guard let last = defaults.object(forKey: "lastWeeklyReport") as? Date else {
+            defaults.set(now, forKey: "lastWeeklyReport") // first run: start counting from today
+            return
+        }
+        let calendar = Calendar.current
+        guard now.timeIntervalSince(last) >= 6 * 86_400, calendar.component(.weekday, from: now) == 2,
+              calendar.component(.hour, from: now) >= 9 else { return }
+        defaults.set(now, forKey: "lastWeeklyReport")
+        timeline.store.weeklyReport { [weak self] report in
+            guard let self, let report else { return }
+            raise(MonitorAlert(title: "Your Mac last week", detail: report.headline, pid: nil, processName: nil, tab: .history))
+        }
+    }
+
+    // MARK: Focus mode
+
+    /// Apps that can be picked for Focus Mode: running regular apps plus ones already picked, by name.
+    func focusCandidates() -> [(id: String, name: String)] {
+        let me = Bundle.main.bundleIdentifier
+        var names: [String: String] = [:]
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+            if let id = app.bundleIdentifier, id != me, id != "com.apple.finder" { names[id] = app.localizedName ?? id }
+        }
+        for id in prefs.focusApps where names[id] == nil {
+            names[id] = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id)
+                .map { FileManager.default.displayName(atPath: $0.path) } ?? id
+        }
+        return names.map { (id: $0.key, name: $0.value) }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    func toggleFocusApp(_ id: String) {
+        if let i = prefs.focusApps.firstIndex(of: id) { prefs.focusApps.remove(at: i) } else { prefs.focusApps.append(id) }
+    }
+
+    /// On: quits the picked apps (normally, so they can ask to save) and remembers which ones were running.
+    /// Off: reopens those in the background.
+    func toggleFocus() {
+        if let quit = prefs.focusQuit {
+            for id in quit {
+                guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { continue }
+                let configuration = NSWorkspace.OpenConfiguration()
+                configuration.activates = false
+                NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+            }
+            prefs.focusQuit = nil
+            flash(quit.isEmpty ? "Focus Mode off" : "Focus Mode off — reopening \(quit.count) app(s)")
+        } else {
+            let apps = NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier.map(prefs.focusApps.contains) ?? false }
+            apps.forEach { $0.terminate() }
+            prefs.focusQuit = apps.compactMap(\.bundleIdentifier)
+            flash(apps.isEmpty ? "Focus Mode on — none of its apps were running"
+                               : "Focus Mode on — quit " + apps.compactMap(\.localizedName).joined(separator: ", "))
+        }
     }
 
     // MARK: Dev
 
     func refreshDev() {
         guard busy.insert("dev").inserted else { return }
+        let needLimits = dockerLimits == nil
         DispatchQueue.global(qos: .utility).async {
             let state = Docker.state()
             let servers = Servers.listening()
+            var limits: (memory: UInt64, cpus: Int)?
+            if needLimits, case .ready = state { limits = Docker.limits() }
             DispatchQueue.main.async {
                 self.docker = state
                 self.servers = servers
+                if case .ready = state { if let limits { self.dockerLimits = limits } } else { self.dockerLimits = nil }
                 self.busy.remove("dev")
             }
         }
+        sampleProcesses()
         if Date().timeIntervalSince(lastLaravelScan) > 300 { scanLaravel() }
     }
 
@@ -723,6 +830,24 @@ final class Monitor: ObservableObject {
         }
     }
 
+    /// "Pause Docker": stops Docker Desktop and its VM (containers stop too); "Start Docker" brings it back.
+    func setDocker(running: Bool) {
+        guard !dockerSwitching else { return }
+        confirmKey = nil
+        dockerSwitching = true
+        flash(running ? "Starting Docker…" : "Stopping Docker and its VM…")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ok = Docker.setDesktopRunning(running)
+            DispatchQueue.main.async {
+                self.dockerSwitching = false
+                self.dockerLimits = nil
+                self.flash(ok ? (running ? "Docker is starting" : "Docker stopped — its VM memory is free again")
+                              : "Couldn't \(running ? "start" : "stop") Docker")
+                self.refreshDev()
+            }
+        }
+    }
+
     func open(port: Int) {
         if let url = URL(string: "http://localhost:\(port)") { NSWorkspace.shared.open(url) }
     }
@@ -743,6 +868,33 @@ final class Monitor: ObservableObject {
             }
         }
     }
+
+    func scanStartup() {
+        guard busy.insert("startup").inserted else { return }
+        scanningStartup = true
+        DispatchQueue.global(qos: .utility).async {
+            let items = StartupItems.scan()
+            DispatchQueue.main.async {
+                self.startupItems = items
+                self.scanningStartup = false
+                self.busy.remove("startup")
+            }
+        }
+    }
+
+    func setStartup(_ item: StartupItem, enabled: Bool) {
+        confirmKey = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ok = enabled ? StartupItems.enable(item) : StartupItems.disable(item)
+            DispatchQueue.main.async {
+                self.flash(ok ? "\(item.title) \(enabled ? "enabled" : "disabled")" : "\(item.title): change cancelled or failed")
+                self.scanStartup()
+            }
+        }
+    }
+
+    /// The latest sample of a process, for showing what a startup item costs.
+    func process(_ pid: pid_t) -> ProcInfo? { processes.first { $0.id == pid } }
 
     func scanProjects() {
         guard busy.insert("projects").inserted else { return }

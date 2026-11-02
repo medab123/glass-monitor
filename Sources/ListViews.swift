@@ -3,7 +3,7 @@ import AppKit
 
 enum Columns {
     static let primary: CGFloat = 72
-    static let secondary: CGFloat = 60
+    static let secondary: CGFloat = 68
     static let action: CGFloat = 18
 }
 
@@ -18,7 +18,13 @@ extension ListTab {
         }
     }
 
-    var secondaryTitle: String { self == .cpu ? "MEMORY" : "CPU" }
+    var secondaryTitle: String {
+        switch self {
+        case .cpu: "MEMORY"
+        case .memory: "COMPRESSED"
+        default: "CPU"
+        }
+    }
 
     func primary(_ x: RowMetrics, memTotal: UInt64) -> (text: String, fraction: Double) {
         switch self {
@@ -31,7 +37,11 @@ extension ListTab {
     }
 
     func secondary(_ x: RowMetrics) -> String {
-        self == .cpu ? bytes(Double(x.mem)) : String(format: "%.1f%%", x.cpu)
+        switch self {
+        case .cpu: bytes(Double(x.mem))
+        case .memory: x.compressed.map { bytes(Double($0)) } ?? "—"
+        default: String(format: "%.1f%%", x.cpu)
+        }
     }
 }
 
@@ -142,7 +152,8 @@ struct ProcessListView: View {
             HStack(spacing: 8) {
                 Text(prefs.groupByApp ? "APP" : "PROCESS").frame(maxWidth: .infinity, alignment: .leading)
                 Text(m.tab.primaryTitle).foregroundStyle(.primary).frame(width: Columns.primary, alignment: .trailing)
-                Text(m.tab.secondaryTitle).frame(width: Columns.secondary, alignment: .trailing)
+                Text(m.tab.secondaryTitle).lineLimit(1).minimumScaleFactor(0.7)
+                    .frame(width: Columns.secondary, alignment: .trailing)
                 Color.clear.frame(width: Columns.action, height: 1)
             }
             .font(.system(size: 9.5, weight: .semibold))
@@ -170,6 +181,7 @@ struct ProcessListView: View {
 
     private var footnote: String? {
         switch m.tab {
+        case .memory: "Compressed = squeezed or moved to swap because RAM is full. Quitting the biggest frees the most."
         case .disk: "macOS only reports disk activity for your own processes; others show —"
         case .network: "Per-process traffic measured with nettop"
         case .energy: "Energy Impact as reported by macOS, the same figure as Activity Monitor's Energy tab"
@@ -235,7 +247,7 @@ struct ProcessListView: View {
                     .foregroundStyle(.secondary)
                     .rotationEffect(.degrees(open ? 90 : 0))
                 ProcessIcon(bundlePath: g.bundlePath, user: g.user)
-            }), title: g.name, subtitle: "\(g.processes.count) processes") { hovering in
+            }), title: g.name, subtitle: groupSubtitle(g)) { hovering in
                 trailing(key: key, metrics: g.metrics, hovering: hovering, canKill: canKill, name: g.name,
                          onKill: { m.kill(group: g, force: $0) }, onAdmin: nil)
             }
@@ -247,11 +259,23 @@ struct ProcessListView: View {
         }
     }
 
+    private func groupSubtitle(_ g: AppGroup) -> String {
+        let count = "\(g.processes.count) processes"
+        guard let script = g.script, !script.subtitle.isEmpty else { return count }
+        return "\(script.subtitle) · \(count)"
+    }
+
     private func processRow(_ p: ProcInfo, indent: CGFloat) -> some View {
         let key = "p:\(p.id)"
-        let subtitle = p.appName.map { $0 != p.name ? "\($0) · \(p.id)" : "\(p.user) · \(p.id)" } ?? "\(p.user) · \(p.id)"
+        let subtitle: String
+        if let script = p.script {
+            // e.g. "--city paris · ~/Projects/crawler · 2285"
+            subtitle = [script.subtitle, "\(p.id)"].filter { !$0.isEmpty }.joined(separator: " · ")
+        } else {
+            subtitle = p.appName.map { $0 != p.name ? "\($0) · \(p.id)" : "\(p.user) · \(p.id)" } ?? "\(p.user) · \(p.id)"
+        }
         return HoverRow(leading: 8 + indent, icon: AnyView(ProcessIcon(bundlePath: p.bundlePath, user: p.user)),
-                        title: p.name, subtitle: subtitle) { hovering in
+                        title: p.displayName, subtitle: subtitle) { hovering in
             trailing(key: key, metrics: p.metrics, hovering: hovering, canKill: !ProcessList.isProtected(p), name: p.name,
                      onKill: { m.kill(p, force: $0) }, onAdmin: { m.adminKill(pid: p.id, name: p.name) })
         }
@@ -293,7 +317,9 @@ struct DevView: View {
     var body: some View {
         ScrollView {
             LazyVStack(spacing: 1) {
-                laravelSection
+                machinesSection
+
+                laravelSection.padding(.top, 6)
 
                 SectionTitle("DOCKER CONTAINERS").padding(.top, 6)
                 switch m.docker {
@@ -312,6 +338,69 @@ struct DevView: View {
             }
         }
         .scrollIndicators(.never)
+    }
+
+    // MARK: Virtual machines
+
+    @ViewBuilder
+    private var machinesSection: some View {
+        SectionTitle("VIRTUAL MACHINES · DOCKER & EMULATORS")
+        if Docker.binary != nil && !m.machines.contains(where: { $0.kind == .docker }) {
+            dockerStoppedRow
+        }
+        ForEach(m.machines) { machineRow($0) }
+        if Docker.binary == nil && m.machines.isEmpty { note("No virtual machines running") }
+    }
+
+    private func machineIcon(_ kind: VirtualMachine.Kind) -> some View {
+        Image(systemName: kind == .docker ? "shippingbox.circle.fill" : kind == .emulator ? "iphone.gen3" : "server.rack")
+            .font(.system(size: 12))
+            .foregroundStyle(kind == .docker ? Color.blue : kind == .emulator ? Color.green : Color.secondary)
+            .frame(width: 22, height: 22)
+            .background(.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+    }
+
+    private var dockerStoppedRow: some View {
+        HoverRow(icon: AnyView(machineIcon(.docker)), title: "Docker VM", subtitle: "Stopped — not using any memory") { _ in
+            PillButton(m.dockerSwitching ? "Starting…" : "Start Docker") { m.setDocker(running: true) }
+                .disabled(m.dockerSwitching)
+        }
+    }
+
+    private func machineRow(_ vm: VirtualMachine) -> some View {
+        let key = "vm:\(vm.id)"
+        var subtitle = vm.compressed.map { "\(bytes(Double($0))) compressed" } ?? "PID \(vm.id)"
+        if vm.kind == .docker, let limits = m.dockerLimits {
+            subtitle = "Limit \(bytes(Double(limits.memory))) · \(limits.cpus) CPUs · " + subtitle
+        }
+        return HoverRow(icon: AnyView(machineIcon(vm.kind)), title: vm.title, subtitle: subtitle) { hovering in
+            Group {
+                if m.confirmKey == key {
+                    HStack(spacing: 6) {
+                        if vm.kind == .docker {
+                            PillButton("Stop Docker", .red) { m.setDocker(running: false) }
+                        } else {
+                            PillButton("Quit", .red) { m.kill(pid: vm.id, name: vm.title, force: false, key: key) }
+                        }
+                        PillButton("Cancel") { withAnimation(.snappy(duration: 0.25)) { m.confirmKey = nil } }
+                    }
+                } else if hovering {
+                    PillButton(vm.kind == .docker ? (m.dockerSwitching ? "Stopping…" : "Pause Docker") : "Quit", .orange) {
+                        withAnimation(.snappy(duration: 0.25)) { m.confirmKey = key }
+                    }
+                    .disabled(m.dockerSwitching)
+                    .help(vm.kind == .docker ? "Stops Docker Desktop and its VM; containers stop until you start Docker again"
+                                             : "Quit \(vm.title)")
+                } else {
+                    HStack(spacing: 8) {
+                        Text(String(format: "%.0f%%", vm.cpu)).frame(width: Columns.primary, alignment: .trailing)
+                        Text(bytes(Double(vm.memory))).fontWeight(.semibold).frame(width: 70, alignment: .trailing)
+                    }
+                    .font(.system(size: 11, design: .rounded)).monospacedDigit()
+                }
+            }
+            .transition(slideIn)
+        }
     }
 
     @ViewBuilder
@@ -488,6 +577,8 @@ struct CleanView: View {
                 LazyVStack(spacing: 1) {
                     ForEach(m.cleanItems) { cleanRow($0) }
 
+                    startupSection
+
                     SectionTitle("PROJECT node_modules").padding(.top, 6)
                     if m.scanningProjects {
                         ProgressView().controlSize(.small).padding(8)
@@ -504,6 +595,60 @@ struct CleanView: View {
                 }
             }
             .scrollIndicators(.never)
+        }
+    }
+
+    // MARK: Startup items
+
+    @ViewBuilder
+    private var startupSection: some View {
+        SectionTitle("STARTUP & BACKGROUND ITEMS").padding(.top, 6)
+        if m.scanningStartup && m.startupItems == nil {
+            ProgressView().controlSize(.small).padding(8)
+        } else if let items = m.startupItems {
+            ForEach(items) { startupRow($0) }
+            Text("Apps in System Settings → General → Login Items aren't listed here.")
+                .font(.system(size: 9.5)).foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8).padding(.vertical, 4)
+        } else {
+            PillButton("Scan startup items") { m.scanStartup() }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+        }
+    }
+
+    private func startupRow(_ item: StartupItem) -> some View {
+        let key = "startup:\(item.id)"
+        let running = item.pid.flatMap(m.process)
+        let icon = ProcessIcon(bundlePath: item.bundlePath, user: "", symbol: item.scope == .system ? "gearshape.2.fill" : "person.crop.circle")
+        let state = item.disabled ? "Disabled" : item.pid == nil ? "Not running" : "Running"
+        return HoverRow(icon: AnyView(icon), title: item.title, subtitle: "\(item.scope.title) · \(state) · \(item.id)") { hovering in
+            Group {
+                if m.confirmKey == key {
+                    HStack(spacing: 6) {
+                        PillButton("Disable", .red) { m.setStartup(item, enabled: false) }
+                        PillButton("Cancel") { withAnimation(.snappy(duration: 0.25)) { m.confirmKey = nil } }
+                    }
+                } else if hovering && !item.isGlassMonitor {
+                    if item.disabled {
+                        PillButton("Enable", .green) { m.setStartup(item, enabled: true) }
+                    } else {
+                        PillButton(item.scope == .system ? "Disable…" : "Disable", .orange) {
+                            withAnimation(.snappy(duration: 0.25)) { m.confirmKey = key }
+                        }
+                        .help(item.scope == .system ? "Asks for your admin password" : "Stops it and keeps it from starting again")
+                    }
+                } else if let p = running {
+                    HStack(spacing: 8) {
+                        Text(String(format: "%.1f%%", p.cpu)).frame(width: Columns.primary, alignment: .trailing)
+                        Text(bytes(Double(p.memBytes))).foregroundStyle(.secondary).frame(width: 70, alignment: .trailing)
+                    }
+                    .font(.system(size: 11, design: .rounded)).monospacedDigit()
+                } else {
+                    Text(state).font(.system(size: 10.5)).foregroundStyle(item.disabled ? .tertiary : .secondary)
+                }
+            }
+            .transition(slideIn)
         }
     }
 

@@ -61,6 +61,65 @@ enum Docker {
         guard let binary else { return false }
         return Shell.run(binary, [action, id]).status == 0
     }
+
+    /// RAM and CPUs Docker Desktop's VM is allowed to use (Settings → Resources); nil when Docker isn't running.
+    static func limits() -> (memory: UInt64, cpus: Int)? {
+        guard let binary else { return nil }
+        let result = Shell.run(binary, ["info", "--format", "{{.MemTotal}} {{.NCPU}}"])
+        let parts = result.output.split(separator: " ").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard result.status == 0, parts.count == 2, let memory = UInt64(parts[0]), let cpus = Int(parts[1]) else { return nil }
+        return (memory, cpus)
+    }
+
+    static let desktopBundleID = "com.docker.docker"
+
+    /// Stops or starts Docker Desktop (and its VM) with the `docker desktop` CLI, falling back to quitting /
+    /// opening the app on versions without it. Slow (seconds): call off the main thread.
+    static func setDesktopRunning(_ running: Bool) -> Bool {
+        if let binary, Shell.run(binary, ["desktop", running ? "start" : "stop"]).status == 0 { return true }
+        if running {
+            guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: desktopBundleID) else { return false }
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+            return true
+        }
+        return NSRunningApplication.runningApplications(withBundleIdentifier: desktopBundleID).map { $0.terminate() }.contains(true)
+    }
+}
+
+// MARK: - Virtual machines
+
+/// A VM process: Docker Desktop's Linux VM, an Android emulator, or another VM. These are often the biggest
+/// memory users on a developer Mac and don't show up under a recognizable app name.
+struct VirtualMachine: Identifiable {
+    enum Kind { case docker, emulator, other }
+
+    let id: pid_t
+    let kind: Kind
+    let title: String
+    let cpu: Double
+    let memory: UInt64
+    let compressed: UInt64?
+
+    init?(_ p: ProcInfo, dockerRunning: Bool) {
+        let name = p.name
+        if name.hasPrefix("com.apple.Virtualization.VirtualMachine") {
+            kind = dockerRunning ? .docker : .other
+            title = dockerRunning ? "Docker VM" : "Virtual machine"
+        } else if name.hasPrefix("qemu-system") {
+            let isEmulator = p.script?.title == "Android Emulator"
+            kind = isEmulator ? .emulator : .other
+            title = isEmulator ? "Android Emulator · \(p.script?.arguments ?? "")" : "QEMU virtual machine"
+        } else if name == "vfkit" || name == "krunkit" {
+            kind = .other
+            title = "Podman / container VM"
+        } else {
+            return nil
+        }
+        id = p.id
+        cpu = p.cpu
+        memory = p.memBytes
+        compressed = p.compressed
+    }
 }
 
 // MARK: - Laravel projects

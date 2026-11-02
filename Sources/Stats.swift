@@ -123,6 +123,14 @@ enum SystemStats {
         return (seconds(me) + seconds(children), result == KERN_SUCCESS ? UInt64(info.phys_footprint) : 0)
     }
 
+    /// When the Mac last started (kern.boottime).
+    static func bootTime() -> Date? {
+        var time = timeval()
+        var size = MemoryLayout<timeval>.size
+        guard sysctlbyname("kern.boottime", &time, &size, nil, 0) == 0, time.tv_sec > 0 else { return nil }
+        return Date(timeIntervalSince1970: Double(time.tv_sec))
+    }
+
     static func memoryPressure() -> MemoryPressure {
         var level: Int32 = 0
         var size = MemoryLayout<Int32>.size

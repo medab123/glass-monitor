@@ -91,6 +91,25 @@ defaults delete com.elabidi.glassmonitor
   ~/code, ~/dev, ~/src, ~/Developer, ~/Herd (depth 6); counts ERROR/CRITICAL/ALERT/EMERGENCY entries in
   `storage/logs/**/*.log` from the last 24 h (line format and JSON/ECS format; newest 4 MB of each log).
   Hover: Open Log, Restart (the project's running compose containers). Rescans every 5 min.
+- Memory column = `ri_phys_footprint` (Activity Monitor's "Memory"), falling back to `ps` RSS for other users'
+  processes; the Memory tab's Compressed column = footprint − resident (matches `top`'s CMPRS without running top).
+- Script names: for python*/node/php/ruby/perl/bun/deno, `claude` (CLI) and `qemu-system*`, the args
+  (`KERN_PROCARGS2`) and working directory (`PROC_PIDVNODEPATHINFO`) give `ProcInfo.script`; each script run
+  is its own group (`groupKey`). Cached per pid in `ProcessSampler.identities`.
+- Dev tab, Virtual machines: `VirtualMachine` from the process list (`com.apple.Virtualization.VirtualMachine`
+  = Docker VM while Docker Desktop runs, `qemu-system*` with `-avd` = Android emulator, vfkit/krunkit).
+  Limits from `docker info`; Pause/Start Docker = `docker desktop stop|start` (fallback: quit/open the app).
+- Restart advice: uptime from `kern.boottime`; advised after 2 days with swap ≥ max(4 GB, RAM/4); alert at
+  most daily (`lastRestartAdvice` default).
+- Weekly report: `HistoryStore.weeklyReport` (needs ≥ 60 recorded minutes); card on the History tab's 7d
+  range; notification Mondays from 9:00, once a week (`lastWeeklyReport` default; first run only starts the clock).
+- Focus mode (footer "Focus" menu): `focusApps` (bundle IDs to quit) and `focusQuit` (what it quit, reopened
+  on turning it off; nil = off).
+- Clean tab, Startup & background items (`Startup.swift`): plists in ~/Library/LaunchAgents,
+  /Library/LaunchAgents, /Library/LaunchDaemons; running state from `launchctl list` / `launchctl print`,
+  disabled state from `launchctl print-disabled`. Disable = `launchctl disable` + `bootout`; system daemons
+  via the admin prompt. Glass Monitor's own agent can't be disabled there. BTM login items aren't listed
+  (`sfltool dumpbtm` is too slow and needs approval).
 - Debug launch args: `--expanded`, `--tab=cpu|memory|disk|network|energy|history|dev|clean`, `--test-alert`,
   `--register-login`, `--unregister-login`, `--shut-down`. `--tab` also takes `energy`.
 
@@ -104,11 +123,12 @@ defaults delete com.elabidi.glassmonitor
 | `HistoryView.swift` | History tab (Swift Charts, hover/pin) |
 | `Stats.swift` | CPU ticks, memory/swap/pressure, disk space & I/O, GPU, network, battery power/time/health (Mach/sysctl/IOKit) |
 | `Sensors.swift` | Temperatures and fans from the SMC (`AppleSMC` IOKit user client; no public API exists) |
-| `Processes.swift` | `ps` sampling, per-process disk/net rates and Energy Impact (`top`), app grouping, icon cache |
+| `Processes.swift` | `ps` sampling, memory footprint/compressed and disk (`proc_pid_rusage`), script detection, net rates, Energy Impact (`top`), app grouping, icon cache |
 | `Network.swift` | Wi-Fi link (CoreWLAN) and interface IPs (`getifaddrs`) for the Network tab strip |
 | `Monitor.swift` | `ObservableObject` model, 1.5 s tick, per-minute history recording, kill/dev/clean actions |
 | `Alerts.swift` | Runaway-CPU and memory-leak detectors + notifications (Quit / Ignore actions) |
-| `DevTools.swift` | Docker, Laravel log scanner, listening ports (`lsof`), disk-cache cleaner |
+| `DevTools.swift` | Docker (incl. VM limits, pause/start), virtual machines, Laravel log scanner, listening ports (`lsof`), disk-cache cleaner |
+| `Startup.swift` | Launch agents/daemons audit: scan, enable, disable |
 | `Shell.swift` | Process runner, admin commands via AppleScript, system tools |
 | `Prefs.swift` | UserDefaults-backed settings |
 | `Components.swift`, `ListViews.swift`, `RootView.swift` | SwiftUI views and formatting |

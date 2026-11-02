@@ -16,6 +16,8 @@ struct HistoryView: View {
             }
             .padding(.horizontal, 8)
 
+            if t.range == .week, let report = t.report { reportCard(report) }
+
             if t.points.count < 2 {
                 Text("Recording one sample a minute — history appears here within a few minutes.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
@@ -46,6 +48,26 @@ struct HistoryView: View {
             }
             .scrollIndicators(.never)
         }
+    }
+
+    private func reportCard(_ r: WeeklyReport) -> some View {
+        var lines = ["CPU averaged \(percent(r.averageCPU)), memory \(percent(r.averageMemory))"
+                     + (r.peakSwap > 0 ? ", swap peaked at \(bytes(Double(r.peakSwap)))" : "")]
+        if let hour = r.busiestHour {
+            lines.append("Busiest: \(hour.formatted(.dateTime.weekday(.wide).hour())) · recorded \(duration(Double(r.minutes) * 60))")
+        }
+        let cpu = r.topCPU.map { "\($0.name) \(String(format: "%.0f%%", $0.cpu))" }.joined(separator: ", ")
+        let memory = r.topMemory.map { "\($0.name) \(bytes(Double($0.memBytes)))" }.joined(separator: ", ")
+        if !cpu.isEmpty { lines.append("Most CPU: " + cpu) }
+        if !memory.isEmpty { lines.append("Most memory (average): " + memory) }
+        return VStack(alignment: .leading, spacing: 2) {
+            Text("THIS WEEK").font(.system(size: 9.5, weight: .semibold)).foregroundStyle(.secondary)
+            ForEach(lines, id: \.self) { Text($0).font(.system(size: 10.5)).lineLimit(1).minimumScaleFactor(0.8) }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private var sortedApps: [HistoryApp] {

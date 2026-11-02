@@ -30,8 +30,10 @@ add-on.
 
 - **Status line**: memory pressure, thermal state (Cool → Throttling), power draw, battery % and
   time left or time to full.
-- **Sensors line**: average CPU and GPU temperature, fan speed ("Fans off" when idle),
+- **Sensors line**: average CPU and GPU temperature, fan speed ("Fans off" when idle), uptime,
   battery health and cycle count (the same figures System Information shows).
+- **Restart advice**: after 2+ days up with swap at a quarter of your RAM (at least 4 GB), the uptime turns
+  orange and you get a once-a-day "Restart recommended" alert. Swap only shrinks again after a restart.
 - **Six live graphs**: CPU (user / system), GPU, memory, swap and compressed memory, disk read/write
   speed and free space, network down/up. Switch between the last **30 minutes, 2 hours, 12 hours or day**;
   the graphs survive restarts (time the app wasn't running shows as a gap). **Hover a graph** to see the time and
@@ -40,8 +42,14 @@ add-on.
 ### Processes (CPU, Memory, Disk, Network, Energy tabs)
 
 - Top processes ranked by CPU, memory, disk activity or network traffic.
+- **Real memory**: each app's memory footprint, the same figure as Activity Monitor's Memory column,
+  including what macOS compressed or moved to swap. The Memory tab adds a **Compressed** column: the apps
+  with the most compressed memory are the ones to quit when the Mac is swapping.
 - **Grouped by app**: all of Chrome's helpers count as one Chrome, with a row you can expand.
   Or list every single process.
+- **Scripts by name**: Python, Node, PHP, Ruby and Perl processes show the script they run, its arguments and
+  folder (`scrape.py --city paris · ~/Projects/crawler` instead of "Python"), and each run is
+  its own row. Claude Code sessions show their project folder; Android emulators show the device name.
 - **Quit, Force Quit** or **kill as admin** (asks for your password) for processes owned by the system.
   Core system processes (kernel_task, WindowServer, launchd, loginwindow) are protected.
 - Network tab: a Wi-Fi strip with signal quality, link speed and IP address.
@@ -55,6 +63,9 @@ add-on.
 
 - Records **one sample a minute for 7 days**, kept in a local SQLite database.
 - Chart of CPU and memory for the last **1 hour, 6 hours, 24 hours or 7 days**.
+- **Weekly report**: the 7-day view starts with the week in numbers (average CPU and memory, peak swap,
+  busiest hour, the apps that used the most CPU and memory), and every Monday morning a notification sums up
+  the past week.
 - **Hover any moment** to see which apps were using CPU and memory then; click to pin it.
   With nothing selected, it shows each app's average CPU and highest memory over the range.
 
@@ -72,6 +83,9 @@ Shown in the pill and as macOS notifications with **Quit** / **Ignore** buttons 
 
 ### Dev
 
+- **Virtual machines**: Docker Desktop's VM (with its memory/CPU limits), Android emulators and other VMs,
+  with their CPU, memory and compressed memory. **Pause Docker** stops Docker Desktop and frees its VM's
+  memory (Start Docker brings it back); emulators can be quit.
 - **Laravel**: finds every project with an `artisan` file and counts the errors logged in the last
   24 hours (Laravel's line format and JSON logs). Shows the latest error; open the log or restart the
   project's Docker containers in one click.
@@ -89,6 +103,15 @@ never deleted permanently.
 - Docker unused images and build cache (never your containers or volumes)
 - `node_modules` folders in your projects, biggest first
 - Shortcuts to review Xcode Archives and the Trash
+
+**Startup & background items**: every launch agent and daemon (your login agents, all-users agents and
+system daemons) with whether it's running and what it costs. Disable one to stop it and keep it from
+starting again, or enable it back. System daemons ask for your admin password.
+
+### Focus mode
+
+The **Focus** button in the panel footer quits the apps you pick (Chrome, Docker, Zoom…) in one click,
+normally so they can ask to save, and reopens them in the background when you turn it off.
 
 ### Tools menu
 

@@ -18,6 +18,30 @@ struct HistoryApp: Identifiable {
     let memBytes: UInt64
 }
 
+/// A week in numbers, for the History tab and the Monday notification.
+struct WeeklyReport {
+    /// Minutes the app recorded (it records nothing while the Mac sleeps or the app is quit).
+    let minutes: Int
+    let averageCPU: Double
+    let averageMemory: Double
+    let peakSwap: UInt64
+    /// Start of the hour with the highest average CPU.
+    let busiestHour: Date?
+    /// Average CPU over the recorded minutes.
+    let topCPU: [HistoryApp]
+    /// Average memory while running.
+    let topMemory: [HistoryApp]
+
+    /// One line for a notification, e.g. "CPU 34% · memory 82% · swap peak 18 GB · Biggest: Chrome 3.1 GB".
+    var headline: String {
+        var parts = ["CPU \(percent(averageCPU))", "memory \(percent(averageMemory))"]
+        if peakSwap > 0 { parts.append("swap peak \(bytes(Double(peakSwap)))") }
+        let biggest = topMemory.prefix(2).map { "\($0.name) \(bytes(Double($0.memBytes)))" }
+        if !biggest.isEmpty { parts.append("Biggest: " + biggest.joined(separator: ", ")) }
+        return parts.joined(separator: " · ")
+    }
+}
+
 enum HistoryRange: Int, CaseIterable, Identifiable {
     case hour = 3_600, sixHours = 21_600, day = 86_400, week = 604_800
 
@@ -114,6 +138,34 @@ final class HistoryStore {
             """, [since], completion: completion, map: Self.app)
     }
 
+    /// The last 7 days; nil until at least an hour has been recorded.
+    func weeklyReport(completion: @escaping (WeeklyReport?) -> Void) {
+        let since = Int64(Date().timeIntervalSince1970) - Int64(HistoryRange.week.rawValue)
+        queue.async {
+            let totals = self.rows("SELECT count(*), avg(cpu), avg(memory), max(swap) FROM samples WHERE ts >= ?1", [since]) {
+                (Int(sqlite3_column_int64($0, 0)), sqlite3_column_double($0, 1), sqlite3_column_double($0, 2),
+                 UInt64(max(0, sqlite3_column_int64($0, 3))))
+            }.first
+            guard let totals, totals.0 >= 60 else { return DispatchQueue.main.async { completion(nil) } }
+            let busiest = self.rows("""
+                SELECT (ts / 3600) * 3600 AS h FROM samples WHERE ts >= ?1
+                GROUP BY h HAVING count(*) >= 30 ORDER BY avg(cpu) DESC LIMIT 1
+                """, [since]) { Date(timeIntervalSince1970: Double(sqlite3_column_int64($0, 0))) }.first
+            let topCPU = self.rows("""
+                SELECT key, max(name), max(bundle), sum(cpu) / ?2, avg(mem)
+                FROM apps WHERE ts >= ?1 GROUP BY key ORDER BY 4 DESC LIMIT 3
+                """, [since, Double(totals.0)], map: Self.app)
+            // Only apps seen in at least a tenth of the minutes, so a one-off spike doesn't top the list.
+            let topMemory = self.rows("""
+                SELECT key, max(name), max(bundle), sum(cpu) / ?2, avg(mem)
+                FROM apps WHERE ts >= ?1 GROUP BY key HAVING count(*) >= ?3 ORDER BY 5 DESC LIMIT 3
+                """, [since, Double(totals.0), Int64(totals.0 / 10)], map: Self.app)
+            let report = WeeklyReport(minutes: totals.0, averageCPU: totals.1, averageMemory: totals.2, peakSwap: totals.3,
+                                      busiestHour: busiest, topCPU: topCPU, topMemory: topMemory)
+            DispatchQueue.main.async { completion(report) }
+        }
+    }
+
     private static func app(_ row: OpaquePointer) -> HistoryApp {
         HistoryApp(id: text(row, 0) ?? "", name: text(row, 1) ?? "?", bundlePath: text(row, 2),
                    cpu: sqlite3_column_double(row, 3), memBytes: UInt64(max(0, sqlite3_column_int64(row, 4))))
@@ -152,14 +204,19 @@ final class HistoryStore {
         sqlite3_finalize(statement)
     }
 
+    private func rows<T>(_ sql: String, _ values: [Any?], map: (OpaquePointer) -> T) -> [T] {
+        var rows: [T] = []
+        if db != nil, let statement = prepare(sql, values) {
+            while sqlite3_step(statement) == SQLITE_ROW { rows.append(map(statement)) }
+            sqlite3_finalize(statement)
+        }
+        return rows
+    }
+
     private func fetch<T>(_ sql: String, _ values: [Any?], completion: @escaping ([T]) -> Void,
                           map: @escaping (OpaquePointer) -> T) {
         queue.async {
-            var rows: [T] = []
-            if self.db != nil, let statement = self.prepare(sql, values) {
-                while sqlite3_step(statement) == SQLITE_ROW { rows.append(map(statement)) }
-                sqlite3_finalize(statement)
-            }
+            let rows = self.rows(sql, values, map: map)
             DispatchQueue.main.async { completion(rows) }
         }
     }
@@ -175,11 +232,14 @@ final class Timeline: ObservableObject {
     /// The minute being inspected: the hovered one, else the clicked (pinned) one; nil shows the range summary.
     @Published private(set) var selected: Date?
     @Published private(set) var pinned: Date?
+    /// Loaded while the 7-day range is shown.
+    @Published private(set) var report: WeeklyReport?
     private var hovered: Date?
 
     func reload() {
         store.points(range) { [weak self] in self?.points = $0 }
         loadApps()
+        if range == .week { store.weeklyReport { [weak self] in self?.report = $0 } }
     }
 
     func hover(_ date: Date?) {

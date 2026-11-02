@@ -47,6 +47,10 @@ final class Prefs: ObservableObject {
     /// The pill is hidden and a menu bar icon brings it back; monitoring and alerts keep running.
     @Published var hidden: Bool { didSet { defaults.set(hidden, forKey: "hidden") } }
     @Published var groupByApp: Bool { didSet { defaults.set(groupByApp, forKey: "groupByApp") } }
+    /// Bundle IDs that Focus Mode quits.
+    @Published var focusApps: [String] { didSet { defaults.set(focusApps, forKey: "focusApps") } }
+    /// The apps Focus Mode actually quit, reopened when it's turned off; nil while Focus Mode is off.
+    @Published var focusQuit: [String]? { didSet { defaults.set(focusQuit, forKey: "focusQuit") } }
     // Alert thresholds; 0 = off.
     @Published var ramAlert: Double { didSet { defaults.set(ramAlert, forKey: "ramAlert") } }
     @Published var swapAlertGB: Double { didSet { defaults.set(swapAlertGB, forKey: "swapAlertGB") } }
@@ -65,6 +69,8 @@ final class Prefs: ObservableObject {
         minimized = defaults.bool(forKey: "minimized")
         hidden = defaults.bool(forKey: "hidden")
         groupByApp = defaults.object(forKey: "groupByApp") as? Bool ?? true
+        focusApps = defaults.stringArray(forKey: "focusApps") ?? []
+        focusQuit = defaults.stringArray(forKey: "focusQuit")
         ramAlert = defaults.object(forKey: "ramAlert") as? Double ?? 0
         swapAlertGB = defaults.object(forKey: "swapAlertGB") as? Double ?? 8
         diskAlert = defaults.object(forKey: "diskAlert") as? Double ?? 0.95

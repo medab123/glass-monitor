@@ -217,6 +217,10 @@ struct RootView: View {
                 status(fanColor(rpm), "fan.fill", rpm < 1 ? "Fans off" : "Fans \(rpm.formatted(.number.precision(.fractionLength(0)))) rpm")
             }
             Spacer(minLength: 0)
+            status(m.restartAdvised ? .orange : .secondary, m.restartAdvised ? "arrow.clockwise.circle.fill" : "clock",
+                   "Up \(duration(m.uptime))" + (m.restartAdvised ? " · restart advised" : ""))
+                .help(m.restartAdvised ? "Swap is \(bytes(Double(m.swapUsed))). It only shrinks after a restart, which will make the Mac faster."
+                                       : "Time since the Mac last started")
             if let battery = m.battery, let capacity = battery.maxCapacity {
                 status(capacity >= 80 ? .green : .orange, "minus.plus.batteryblock",
                        "Health \(capacity)%" + (battery.cycles.map { " · \($0) cycles" } ?? ""))
@@ -319,6 +323,7 @@ struct RootView: View {
                 .contentTransition(.opacity)
                 .animation(.easeInOut(duration: 0.25), value: m.message)
             Spacer(minLength: 4)
+            focusMenu
             Menu {
                 ForEach(SystemAction.allCases) { action in
                     Button { m.run(action) } label: {
@@ -338,6 +343,29 @@ struct RootView: View {
             .menuIndicator(.hidden)
             .fixedSize()
         }
+    }
+}
+
+extension RootView {
+    /// Focus Mode: quit the picked heavy apps while you need the speed, reopen them afterwards.
+    var focusMenu: some View {
+        Menu {
+            Button(m.focusOn ? "Turn Off Focus Mode (reopen apps)" : "Turn On Focus Mode (quit apps below)") { m.toggleFocus() }
+                .disabled(!m.focusOn && prefs.focusApps.isEmpty)
+            Divider()
+            Text("Apps to quit")
+            ForEach(m.focusCandidates(), id: \.id) { app in
+                Toggle(app.name, isOn: Binding(get: { prefs.focusApps.contains(app.id) }, set: { _ in m.toggleFocusApp(app.id) }))
+            }
+        } label: {
+            Label(m.focusOn ? "Focus On" : "Focus", systemImage: m.focusOn ? "bolt.fill" : "bolt")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(m.focusOn ? Color.orange : Color.primary)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Focus Mode quits the apps you pick to free memory and CPU, and reopens them when you turn it off")
     }
 }
 

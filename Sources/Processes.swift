@@ -7,6 +7,21 @@ struct RowMetrics {
     var net: Double?
     /// macOS "Energy Impact" (the Energy tab of Activity Monitor); only sampled while the Energy tab is open.
     var energy: Double?
+    /// Memory macOS compressed or moved to swap (footprint not resident in RAM); nil for other users' processes.
+    var compressed: UInt64?
+}
+
+/// What an interpreter (Python, Node, PHP…), Claude Code or an emulator is actually running,
+/// so a row reads "scrape.py" instead of "Python".
+struct ScriptInfo: Equatable {
+    let title: String
+    /// The remaining arguments, which tell several runs of the same script apart.
+    let arguments: String
+    /// Working directory, "~/…".
+    let folder: String?
+
+    var key: String { "\(title) \(arguments)|\(folder ?? "")" }
+    var subtitle: String { [arguments, folder ?? ""].filter { !$0.isEmpty }.joined(separator: " · ") }
 }
 
 struct ProcInfo: Identifiable {
@@ -14,16 +29,24 @@ struct ProcInfo: Identifiable {
     let name: String
     let user: String
     let cpu: Double
+    /// Memory footprint (Activity Monitor's "Memory", including compressed and swapped memory) when readable,
+    /// otherwise resident size.
     let memBytes: UInt64
+    var compressed: UInt64?
     /// Bytes/s; nil when macOS doesn't let us read it (other users' processes) or on the first sample.
     var diskRate: Double?
     var netRate: Double?
     var energy: Double?
     let appName: String?
     let bundlePath: String?
+    var script: ScriptInfo?
 
-    var groupKey: String { bundlePath ?? "proc:\(name)" }
-    var metrics: RowMetrics { RowMetrics(cpu: cpu, mem: memBytes, disk: diskRate, net: netRate, energy: energy) }
+    /// Each script run is its own group, so two scrapers don't merge into one "Python" row.
+    var groupKey: String { script.map { "script:\($0.key)" } ?? bundlePath ?? "proc:\(name)" }
+    var displayName: String { script?.title ?? name }
+    var metrics: RowMetrics {
+        RowMetrics(cpu: cpu, mem: memBytes, disk: diskRate, net: netRate, energy: energy, compressed: compressed)
+    }
 }
 
 /// All processes belonging to one app bundle (e.g. Chrome and its helpers), or sharing a name.
@@ -41,10 +64,12 @@ struct AppGroup: Identifiable {
             if let d = p.diskRate { total.disk = (total.disk ?? 0) + d }
             if let n = p.netRate { total.net = (total.net ?? 0) + n }
             if let e = p.energy { total.energy = (total.energy ?? 0) + e }
+            if let c = p.compressed { total.compressed = (total.compressed ?? 0) + c }
         }
     }
 
-    var name: String { processes.first?.appName ?? processes.first?.name ?? "?" }
+    var name: String { processes.first.map { $0.script?.title ?? $0.appName ?? $0.name } ?? "?" }
+    var script: ScriptInfo? { processes.first?.script }
     var bundlePath: String? { processes.first?.bundlePath }
     var user: String { processes.first?.user ?? "" }
 }
@@ -66,14 +91,83 @@ enum ProcessList {
         return (FileManager.default.displayName(atPath: bundle), bundle)
     }
 
-    /// Total bytes read + written by a process; nil without permission (other users' processes).
-    static func diskBytes(of pid: pid_t) -> UInt64? {
-        var info = rusage_info_v2()
+    /// Disk bytes read + written, memory footprint and resident size; nil without permission (other users' processes).
+    /// Footprint − resident is the memory macOS compressed or swapped out: it matches `top`'s CMPRS column
+    /// without the second of CPU a `top` run costs.
+    static func usage(of pid: pid_t) -> (disk: UInt64, footprint: UInt64, resident: UInt64)? {
+        var info = rusage_info_v4()
         let result = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V2, $0) }
+            $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V4, $0) }
         }
+        guard result == 0 else { return nil }
         // Wrapping add: some processes report garbage counters near UInt64.max, and a plain + traps.
-        return result == 0 ? info.ri_diskio_bytesread &+ info.ri_diskio_byteswritten : nil
+        return (info.ri_diskio_bytesread &+ info.ri_diskio_byteswritten, info.ri_phys_footprint, info.ri_resident_size)
+    }
+
+    private static let interpreters: Set<String> = ["node", "php", "ruby", "perl", "bun", "deno"]
+    /// Interpreter flags that take a value, so the value isn't mistaken for the script.
+    private static let flagsWithValue: Set<String> = ["-W", "-X", "-r", "--require", "--import", "--loader", "-d"]
+
+    /// The script an interpreter runs (with its arguments and folder), Claude Code's project folder,
+    /// or the Android emulator's device name. nil for everything else. Reads the process's own arguments,
+    /// so it only works for your processes.
+    static func script(of pid: pid_t, name: String) -> ScriptInfo? {
+        let lower = name.lowercased()
+        let isClaude = name == "claude" // the Claude Code CLI; the desktop app is "Claude"
+        let isEmulator = lower.hasPrefix("qemu-system")
+        guard isClaude || isEmulator || lower.hasPrefix("python") || interpreters.contains(lower),
+              let args = arguments(of: pid) else { return nil }
+        let folder = workingDirectory(of: pid).map { ($0 as NSString).abbreviatingWithTildeInPath }
+
+        if isClaude { return ScriptInfo(title: "Claude Code", arguments: "", folder: folder) }
+        if isEmulator {
+            guard let i = args.firstIndex(of: "-avd"), i + 1 < args.count else { return nil }
+            return ScriptInfo(title: "Android Emulator", arguments: args[i + 1], folder: nil)
+        }
+
+        var rest = args.dropFirst()
+        var title: String?
+        while let token = rest.popFirst() {
+            if token == "-m", let module = rest.popFirst() { title = module; break }
+            if token == "-c" || token == "-e" { title = "\(name) \(token)"; rest = []; break }
+            if flagsWithValue.contains(token) { _ = rest.popFirst(); continue }
+            if token.hasPrefix("-") { continue }
+            title = (token as NSString).lastPathComponent
+            break
+        }
+        guard var shown = title else { return nil }
+        // `php artisan queue:work` reads better with the command in the title.
+        if shown == "artisan", let command = rest.popFirst() { shown += " \(command)" }
+        return ScriptInfo(title: shown, arguments: String(rest.joined(separator: " ").prefix(120)), folder: folder)
+    }
+
+    /// argv via KERN_PROCARGS2: an argc int, the executable path, padding, then the arguments.
+    private static func arguments(of pid: pid_t) -> [String]? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return nil }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return nil }
+        let argc = Int(buffer.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) })
+        var index = MemoryLayout<Int32>.size
+        while index < size, buffer[index] != 0 { index += 1 } // executable path
+        while index < size, buffer[index] == 0 { index += 1 } // padding
+        var args: [String] = []
+        while args.count < argc, index < size {
+            let start = index
+            while index < size, buffer[index] != 0 { index += 1 }
+            args.append(String(decoding: buffer[start..<index], as: UTF8.self))
+            index += 1
+        }
+        return args
+    }
+
+    private static func workingDirectory(of pid: pid_t) -> String? {
+        var info = proc_vnodepathinfo()
+        let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else { return nil }
+        let path = withUnsafeBytes(of: info.pvi_cdir.vip_path) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        return path.isEmpty || path == "/" ? nil : path
     }
 }
 
@@ -92,7 +186,7 @@ enum Icons {
 /// Samples the process table off the main thread, turning cumulative disk/network counters into rates.
 final class ProcessSampler {
     private let queue = DispatchQueue(label: "glassmonitor.sampler", qos: .utility)
-    private var identities: [pid_t: (appName: String?, bundlePath: String?)] = [:]
+    private var identities: [pid_t: (appName: String?, bundlePath: String?, script: ScriptInfo?)] = [:]
     private var lastDisk: [pid_t: UInt64] = [:]
     private var lastDiskTime: Date?
     private var lastNet: [pid_t: UInt64] = [:]
@@ -125,11 +219,15 @@ final class ProcessSampler {
         var disk: [pid_t: UInt64] = [:]
         var result: [ProcInfo] = []
         for row in ps() {
-            let identity = identities[row.pid] ?? ProcessList.identity(of: row.pid)
+            let identity = identities[row.pid] ?? {
+                let app = ProcessList.identity(of: row.pid)
+                return (app.appName, app.bundlePath, ProcessList.script(of: row.pid, name: row.name))
+            }()
             identities[row.pid] = identity
 
+            let usage = ProcessList.usage(of: row.pid)
             var diskRate: Double?
-            if let total = ProcessList.diskBytes(of: row.pid) {
+            if let total = usage?.disk {
                 disk[row.pid] = total
                 if let dt = diskInterval, let previous = lastDisk[row.pid] {
                     diskRate = Double(total &- previous) / dt
@@ -144,10 +242,12 @@ final class ProcessSampler {
                 netRate = total >= previous ? Double(total - previous) / dt : 0
             }
 
-            result.append(ProcInfo(id: row.pid, name: row.name, user: row.user, cpu: row.cpu, memBytes: row.mem,
+            result.append(ProcInfo(id: row.pid, name: row.name, user: row.user, cpu: row.cpu,
+                                   memBytes: usage?.footprint ?? row.mem,
+                                   compressed: usage.map { $0.footprint > $0.resident ? $0.footprint - $0.resident : 0 },
                                    diskRate: diskRate, netRate: netRate,
                                    energy: energy ? energyImpact[row.pid] ?? 0 : nil,
-                                   appName: identity.appName, bundlePath: identity.bundlePath))
+                                   appName: identity.appName, bundlePath: identity.bundlePath, script: identity.script))
         }
 
         lastDisk = disk
